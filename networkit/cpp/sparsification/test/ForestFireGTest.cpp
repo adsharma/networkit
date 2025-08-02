@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <networkit/graph/GraphW.hpp>
 #include <networkit/sparsification/ForestFireScore.hpp>
 
 namespace NetworKit {
@@ -14,7 +15,7 @@ namespace NetworKit {
 class ForestFireGTest : public testing::Test {};
 
 TEST_F(ForestFireGTest, testForestFireScore) {
-    Graph G(5);
+    GraphW G(5);
     G.addEdge(0, 1); // 0     G:  0 - 1
     G.addEdge(0, 2); // 1         | / |
     G.addEdge(1, 2); // 2         2 - 3

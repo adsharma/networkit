@@ -9,6 +9,7 @@
 #define NETWORKIT_COARSENING_MATCHING_COARSENING_HPP_
 
 #include <networkit/coarsening/GraphCoarsening.hpp>
+#include <networkit/graph/GraphW.hpp>
 #include <networkit/matching/Matching.hpp>
 
 namespace NetworKit {
