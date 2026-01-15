@@ -7,14 +7,57 @@ from libcpp.vector cimport vector
 from libcpp.utility cimport pair
 from libcpp.string cimport string
 from libcpp.unordered_set cimport unordered_set
-
+from libcpp.memory cimport shared_ptr
 from .base cimport _Algorithm, Algorithm
 from .structures cimport edgeid, index, count, node, edgeweight
+
+# PyArrow C++ interface declarations
+cdef extern from "arrow/api.h" namespace "arrow":
+	cdef cppclass UInt64Array:
+		pass
+	cdef cppclass CArray "arrow::Array":
+		pass
+
+	# Result type for Arrow operations
+	cdef cppclass CStatus "arrow::Status":
+		string ToString()
+
+	cdef cppclass CResult "arrow::Result" [T]:
+		bool_t ok()
+		T ValueOrDie() except +
+		CStatus status()
+
+# Python C API
+cdef extern from "Python.h":
+	void* PyCapsule_GetPointer(object capsule, const char* name) except NULL
+
+# PyArrow C Data Interface
+cdef extern from "arrow/c/abi.h":
+	cdef struct ArrowArray:
+		pass
+	cdef struct ArrowSchema:
+		pass
+
+cdef extern from "arrow/c/bridge.h" namespace "arrow":
+	CResult[shared_ptr[CArray]] ImportArray "arrow::ImportArray" (ArrowArray* c_array, ArrowSchema* c_schema) except +
+
+cdef extern from "arrow/type.h" namespace "arrow":
+	cdef cppclass DataType:
+		pass
+	shared_ptr[DataType] uint64 "arrow::uint64" () except +
+
+# Note: PyArrow integration was complex due to missing headers
+# Use vector-based approach for now as fallback
+# cdef extern from "arrow/python/pyarrow.h" namespace "arrow::py":
+# 	shared_ptr[UInt64Array] unwrap_array "arrow::py::unwrap_array" (object) except +
 
 cdef extern from "<algorithm>" namespace "std":
 	void swap[T](T &a,  T &b)
 	_Graph move( _Graph t ) nogil
 	vector[double] move(vector[double])
+
+cdef extern from "<memory>" namespace "std":
+	shared_ptr[T] static_pointer_cast[T, U](shared_ptr[U] ptr) nogil
 
 cdef extern from "cython_helper.h":
 	void throw_runtime_error(string message)
@@ -39,7 +82,7 @@ cdef extern from "<networkit/graph/Graph.hpp>":
 		_Graph(count, bool_t, bool_t, bool_t) except +
 		_Graph(const _Graph& other) except +
 		_Graph(const _Graph& other, bool_t weighted, bool_t directed, bool_t edgesIndexed) except +
-		void indexEdges(bool_t) except +
+		_Graph(count n, bool_t directed, shared_ptr[UInt64Array] outIndices, shared_ptr[UInt64Array] outIndptr, shared_ptr[UInt64Array] inIndices, shared_ptr[UInt64Array] inIndptr) except +
 		bool_t hasEdgeIds() except +
 		edgeid edgeId(node, node) except +
 		count numberOfNodes() except +
@@ -52,21 +95,7 @@ cdef extern from "<networkit/graph/Graph.hpp>":
 		double weightedDegree(node u, bool_t) except +
 		double weightedDegreeIn(node u, bool_t) except +
 		bool_t isIsolated(node u) except +
-		node addNode() except +
-		node addNodes(node) except +
-		void removeNode(node u) except +
 		bool_t hasNode(node u) except +
-		void restoreNode(node u) except +
-		bool_t addEdge(node u, node v, edgeweight w, bool_t checkMultiEdge) except +
-		void setWeight(node u, node v, edgeweight w) except +
-		void increaseWeight(node u, node v, edgeweight w) except +
-		void removeEdge(node u, node v) except +
-		void removeAllEdges() except +
-		void removeSelfLoops() except +
-		void removeMultiEdges() except +
-		void swapEdge(node s1, node t1, node s2, node t2) except +
-		void compactEdges() except +
-		void sortEdges() except +
 		bool_t hasEdge(node u, node v) except +
 		edgeweight weight(node u, node v) except +
 		void forEdges[Callback](Callback c) except +
@@ -101,6 +130,29 @@ cdef extern from "<networkit/graph/Graph.hpp>":
 		_EdgeDoubleAttribute getEdgeDoubleAttribute(string) except +
 		_EdgeStringAttribute getEdgeStringAttribute(string) except +
 		void detachEdgeAttribute(string) except +
+
+cdef extern from "<networkit/graph/GraphW.hpp>":
+	cdef cppclass _GraphW "NetworKit::GraphW" (_Graph):
+		_GraphW() except +
+		_GraphW(count, bool_t, bool_t, bool_t) except +
+		_GraphW(const _Graph& other) except +
+		_GraphW(const _Graph& other, bool_t, bool_t, bool_t) except +
+		_GraphW(const _GraphW& other) except +
+		void indexEdges(bool_t force) except +
+		node addNode() except +
+		node addNodes(node) except +
+		void removeNode(node u) except +
+		void restoreNode(node u) except +
+		bool_t addEdge(node u, node v, edgeweight w, bool_t checkMultiEdge) except +
+		void setWeight(node u, node v, edgeweight w) except +
+		void increaseWeight(node u, node v, edgeweight w) except +
+		void removeEdge(node u, node v) except +
+		void removeAllEdges() except +
+		void removeSelfLoops() except +
+		void removeMultiEdges() except +
+		void swapEdge(node s1, node t1, node s2, node t2) except +
+		void compactEdges() except +
+		void sortEdges() except +
 
 cdef extern from "<networkit/graph/Graph.hpp>":
 	cdef cppclass _NodeIterator "NetworKit::Graph::NodeIterator":
@@ -188,7 +240,7 @@ cdef extern from "<networkit/graph/Graph.hpp>":
 		void write(string) except +
 		void read(string) except +
 		void swap(_NodeIntAttribute& other)
-		string getName() except +	
+		string getName() except +
 
 cdef extern from "<networkit/graph/Graph.hpp>":
 	cdef cppclass _NodeDoubleAttribute "NetworKit::Graph::NodeDoubleAttribute":
@@ -289,6 +341,11 @@ cdef extern from "<networkit/graph/Graph.hpp>":
 cdef class Graph:
 	cdef _Graph _this
 	cdef setThis(self, _Graph& other)
+	cdef setThisFromGraphW(self, _GraphW& other)
+
+cdef class GraphW:
+	cdef _GraphW _this
+	cdef setThis(self, _GraphW& other)
 
 cdef class NodeIntAttribute:
 	cdef _NodeIntAttribute _this

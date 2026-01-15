@@ -34,7 +34,7 @@ const std::map<std::string, node> &EdgeListReader::getNodeMap() const {
     return this->mapNodeIds;
 }
 
-Graph EdgeListReader::read(std::string_view path) {
+GraphW EdgeListReader::read(std::string_view path) {
     this->mapNodeIds.clear();
     MemoryMappedFile mmfile(path);
     auto it = mmfile.cbegin();
@@ -42,7 +42,7 @@ Graph EdgeListReader::read(std::string_view path) {
 
     bool weighted = false;
     bool checkedWeighted = false;
-    Graph graph(0, weighted, directed);
+    GraphW graph(0, weighted, directed);
 
     DEBUG("separator: ", this->separator);
     DEBUG("first node: ", this->firstNode);

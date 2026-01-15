@@ -105,8 +105,8 @@ std::vector<bool> RandomMaximumSpanningForest::getAttribute(bool move) {
     return result;
 }
 
-Graph RandomMaximumSpanningForest::getMSF(bool move) {
-    Graph result;
+GraphW RandomMaximumSpanningForest::getMSF(bool move) {
+    GraphW result;
 
     if (!hasMSF)
         throw std::runtime_error("Error: The run() method must be executed first");

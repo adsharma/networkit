@@ -39,6 +39,9 @@
 
 #include <tlx/define/deprecated.hpp>
 
+#include <arrow/api.h>
+#include <arrow/compute/api.h>
+
 namespace NetworKit {
 
 struct Edge {
@@ -104,8 +107,9 @@ class CurveballMaterialization;
  * @ingroup graph
  * A graph (with optional weights) and parallel iterator methods.
  */
-class Graph final {
+class Graph {
 
+protected:
     // graph attributes
     //!< current number of nodes
     count n;
@@ -142,22 +146,19 @@ class Graph final {
     //!< exists[v] is true if node v has not been removed from the graph
     std::vector<bool> exists;
 
-    //!< only used for directed graphs, inEdges[v] contains all nodes u that
-    //!< have an edge (u, v)
-    std::vector<std::vector<node>> inEdges;
-    //!< (outgoing) edges, for each edge (u, v) v is saved in outEdges[u] and
-    //!< for undirected also u in outEdges[v]
-    std::vector<std::vector<node>> outEdges;
-
-    //!< only used for directed graphs, same schema as inEdges
-    std::vector<std::vector<edgeweight>> inEdgeWeights;
-    //!< same schema (and same order!) as outEdges
-    std::vector<std::vector<edgeweight>> outEdgeWeights;
-
-    //!< only used for directed graphs, same schema as inEdges
-    std::vector<std::vector<edgeid>> inEdgeIds;
-    //!< same schema (and same order!) as outEdges
-    std::vector<std::vector<edgeid>> outEdgeIds;
+    // CSR arrays for memory-efficient graph storage (zero-copy from Arrow)
+    //!< Arrow array for CSR indices (neighbor node IDs) for outgoing edges
+    std::shared_ptr<arrow::UInt64Array> outEdgesCSRIndices;
+    //!< Arrow array for CSR indptr (offsets into indices array) for outgoing edges
+    std::shared_ptr<arrow::UInt64Array> outEdgesCSRIndptr;
+    //!< Arrow array for CSR indices (neighbor node IDs) for incoming edges - only for directed
+    //!< graphs
+    std::shared_ptr<arrow::UInt64Array> inEdgesCSRIndices;
+    //!< Arrow array for CSR indptr (offsets into indices array) for incoming edges - only for
+    //!< directed graphs
+    std::shared_ptr<arrow::UInt64Array> inEdgesCSRIndptr;
+    //!< flag to indicate if CSR arrays are being used instead of vectors
+    bool usingCSR;
 
 private:
     AttributeMap<PerNode, Graph> nodeAttributeMap;
@@ -250,7 +251,7 @@ public:
     using EdgeDoubleAttribute = Attribute<PerEdge, Graph, double, false>;
     using EdgeStringAttribute = Attribute<PerEdge, Graph, std::string, false>;
 
-private:
+protected:
     /**
      * Returns the index of node u in the array of incoming edges of node v.
      * (for directed graphs inEdges is searched, while for indirected outEdges
@@ -263,6 +264,28 @@ private:
      */
     index indexInOutEdgeArray(node u, node v) const;
 
+    // CSR helper methods
+    /**
+     * Get neighbors of node u using CSR format for outgoing edges
+     */
+    std::pair<const node *, count> getCSROutNeighbors(node u) const;
+
+    /**
+     * Get neighbors of node u using CSR format for incoming edges
+     */
+    std::pair<const node *, count> getCSRInNeighbors(node u) const;
+
+    /**
+     * Check if edge (u,v) exists using CSR format
+     */
+    bool hasEdgeCSR(node u, node v) const;
+
+    /**
+     * Get degree of node using CSR format
+     */
+    count degreeCSR(node u, bool incoming = false) const;
+
+private:
     /**
      * Computes the weighted in/out degree of node @a u.
      *
@@ -561,14 +584,16 @@ public:
 
         NeighborIterator begin() const {
             assert(G);
-            return InEdges ? NeighborIterator(G->inEdges[u].begin())
-                           : NeighborIterator(G->outEdges[u].begin());
+            // Base Graph class only supports CSR format
+            throw std::runtime_error("NeighborRange iterators not supported in base Graph class - "
+                                     "use GraphW for mutable operations");
         }
 
         NeighborIterator end() const {
             assert(G);
-            return InEdges ? NeighborIterator(G->inEdges[u].end())
-                           : NeighborIterator(G->outEdges[u].end());
+            // Base Graph class only supports CSR format
+            throw std::runtime_error("NeighborRange iterators not supported in base Graph class - "
+                                     "use GraphW for mutable operations");
         }
     };
 
@@ -593,17 +618,16 @@ public:
 
         NeighborWeightIterator begin() const {
             assert(G);
-            return InEdges
-                       ? NeighborWeightIterator(G->inEdges[u].begin(), G->inEdgeWeights[u].begin())
-                       : NeighborWeightIterator(G->outEdges[u].begin(),
-                                                G->outEdgeWeights[u].begin());
+            // Base Graph class only supports CSR format
+            throw std::runtime_error("NeighborWeightRange iterators not supported in base Graph "
+                                     "class - use GraphW for mutable operations");
         }
 
         NeighborWeightIterator end() const {
             assert(G);
-            return InEdges
-                       ? NeighborWeightIterator(G->inEdges[u].end(), G->inEdgeWeights[u].end())
-                       : NeighborWeightIterator(G->outEdges[u].end(), G->outEdgeWeights[u].end());
+            // Base Graph class only supports CSR format
+            throw std::runtime_error("NeighborWeightRange iterators not supported in base Graph "
+                                     "class - use GraphW for mutable operations");
         }
     };
 
@@ -627,159 +651,17 @@ public:
           EdgeMerger edgeMerger = std::plus<edgeweight>())
         : n(G.n), m(G.m), storedNumberOfSelfLoops(G.storedNumberOfSelfLoops), z(G.z),
           omega(edgesIndexed ? G.omega : 0), t(G.t), weighted(weighted), directed(directed),
-          edgesIndexed(edgesIndexed), // edges are not indexed by default
-          exists(G.exists),
-
-          // let the following be empty for the start, we fill them later
-          inEdges(0), outEdges(0), inEdgeWeights(0), outEdgeWeights(0), inEdgeIds(0), outEdgeIds(0),
+          edgesIndexed(edgesIndexed),        // edges are not indexed by default
+          exists(G.exists), usingCSR(false), // Base Graph doesn't use CSR by default
 
           // copy node attribute map
           nodeAttributeMap(G.nodeAttributeMap, this),
           // fill this later
           edgeAttributeMap(this) {
 
-        if (G.isDirected() == directed) {
-            // G.inEdges might be empty (if G is undirected), but
-            // that's fine
-            inEdges = G.inEdges;
-            outEdges = G.outEdges;
-            edgeAttributeMap = AttributeMap(G.edgeAttributeMap, this);
-
-            // copy weights if needed
-            if (weighted) {
-                if (G.isWeighted()) {
-                    // just copy from G, again either both graphs are directed or both are
-                    // undirected
-                    inEdgeWeights = G.inEdgeWeights;
-                    outEdgeWeights = G.outEdgeWeights;
-                } else {
-                    // G has no weights, set defaultEdgeWeight for all edges
-                    if (directed) {
-                        inEdgeWeights.resize(z);
-                        for (node u = 0; u < z; u++) {
-                            inEdgeWeights[u].resize(G.inEdges[u].size(), defaultEdgeWeight);
-                        }
-                    }
-
-                    outEdgeWeights.resize(z);
-                    for (node u = 0; u < z; u++) {
-                        outEdgeWeights[u].resize(outEdges[u].size(), defaultEdgeWeight);
-                    }
-                }
-            }
-            if (G.hasEdgeIds() && edgesIndexed) {
-                inEdgeIds = G.inEdgeIds;
-                outEdgeIds = G.outEdgeIds;
-            }
-        } else if (G.isDirected()) {
-            // G is directed, but we want an undirected graph
-            // so we need to combine the out and in stuff for every node
-
-            // for edge attributes, it is not well defined how they should be comined - we will skip
-            // that step and warn the user
-            WARN("Edge attributes are not preserved when converting from directed to undirected "
-                 "graphs. The resulting graph will have empty edge attributes.");
-
-            outEdges.resize(z);
-            if (weighted)
-                outEdgeWeights.resize(z);
-            if (G.hasEdgeIds() && edgesIndexed)
-                outEdgeIds.resize(z);
-            G.balancedParallelForNodes([&](node u) {
-                // copy both out and in edges into our new outEdges
-                outEdges[u].reserve(G.outEdges[u].size() + G.inEdges[u].size());
-                outEdges[u].insert(outEdges[u].end(), G.outEdges[u].begin(), G.outEdges[u].end());
-                if (weighted) {
-                    if (G.isWeighted()) {
-                        // same for weights
-                        outEdgeWeights[u].reserve(G.outEdgeWeights[u].size()
-                                                  + G.inEdgeWeights[u].size());
-                        outEdgeWeights[u].insert(outEdgeWeights[u].end(),
-                                                 G.outEdgeWeights[u].begin(),
-                                                 G.outEdgeWeights[u].end());
-                    } else {
-                        // we are undirected, so no need to write anything into inEdgeWeights
-                        outEdgeWeights[u].resize(outEdges[u].size(), defaultEdgeWeight);
-                    }
-                }
-                if (G.hasEdgeIds() && edgesIndexed) {
-                    // copy both out and in edges ids into our new outEdgesIds
-                    outEdgeIds[u].reserve(G.outEdgeIds[u].size() + G.inEdgeIds[u].size());
-                    outEdgeIds[u].insert(outEdgeIds[u].end(), G.outEdgeIds[u].begin(),
-                                         G.outEdgeIds[u].end());
-                }
-            });
-            G.balancedParallelForNodes([&](node u) {
-                // this is necessary to avoid multi edges, because both u -> v and v -> u can exist
-                // in G
-                count edgeSurplus = 0;
-                for (count i = 0; i < G.inEdges[u].size(); ++i) {
-                    node v = G.inEdges[u][i];
-                    bool alreadyPresent = false;
-                    for (count j = 0; j < G.outEdges[u].size(); ++j) {
-                        if (v != G.outEdges[u][j])
-                            continue; // the edge already exists as an out edge
-                        alreadyPresent = true;
-                        if (u != v) {
-                            ++edgeSurplus;
-                            if (weighted) // we need combine those edges weights when making it a
-                                          // single edge
-                                outEdgeWeights[u][j] =
-                                    G.isWeighted()
-                                        ? edgeMerger(G.inEdgeWeights[u][i], G.outEdgeWeights[u][j])
-                                        : edgeMerger(defaultEdgeWeight, defaultEdgeWeight);
-                            if (G.hasEdgeIds() && edgesIndexed)
-                                outEdgeIds[u][j] = std::min(G.inEdgeIds[u][i], G.outEdgeIds[u][j]);
-                        }
-                        break;
-                    }
-                    if (!alreadyPresent) { // an equivalent out edge wasn't present so we add it
-                        outEdges[u].push_back(v);
-                        if (weighted)
-                            outEdgeWeights[u].push_back(G.isWeighted() ? G.inEdgeWeights[u][i]
-                                                                       : defaultEdgeWeight);
-                        if (G.hasEdgeIds() && edgesIndexed)
-                            outEdgeIds[u].push_back(G.inEdgeIds[u][i]);
-                    }
-                }
-#pragma omp atomic
-                m -= edgeSurplus;
-            });
-        } else {
-            // G is not directed, but this copy should be
-            // generally we can can copy G.out stuff into our in stuff
-
-            // for edge attributes, we currently do not have a way to iterate them for duplication
-            WARN("Edge attributes are currently not preserved when converting from undirected to "
-                 "directed graphs.");
-
-            inEdges = G.outEdges;
-            outEdges = G.outEdges;
-            if (weighted) {
-                if (G.isWeighted()) {
-                    inEdgeWeights = G.outEdgeWeights;
-                    outEdgeWeights = G.outEdgeWeights;
-                } else {
-                    // initialize both inEdgeWeights and outEdgeWeights with the
-                    // defaultEdgeWeight
-                    inEdgeWeights.resize(z);
-                    for (node u = 0; u < z; ++u) {
-                        inEdgeWeights[u].resize(inEdges[u].size(), defaultEdgeWeight);
-                    }
-                    outEdgeWeights.resize(z);
-                    for (node u = 0; u < z; ++u) {
-                        outEdgeWeights[u].resize(outEdges[u].size(), defaultEdgeWeight);
-                    }
-                }
-            }
-            if (G.hasEdgeIds() && edgesIndexed) {
-                inEdgeIds = G.outEdgeIds;
-                outEdgeIds = G.outEdgeIds;
-            }
-        }
-
-        if (!G.edgesIndexed && edgesIndexed)
-            indexEdges();
+        // Base Graph class only supports CSR format and is immutable
+        throw std::runtime_error("Graph template copy constructor not supported in base Graph "
+                                 "class - use GraphW for conversions and mutable operations");
     }
 
     /**
@@ -791,6 +673,21 @@ public:
     Graph(std::initializer_list<WeightedEdge> edges);
 
     /**
+     * Create a graph from CSR arrays for memory-efficient storage.
+     *
+     * @param n Number of nodes.
+     * @param directed If set to @c true, the graph will be directed.
+     * @param outIndices CSR indices array containing neighbor node IDs for outgoing edges
+     * @param outIndptr CSR indptr array containing offsets into outIndices for each node
+     * @param inIndices CSR indices array containing neighbor node IDs for incoming edges (directed
+     * only)
+     * @param inIndptr CSR indptr array containing offsets into inIndices for each node (directed
+     * only)
+     */
+    Graph(count n, bool directed, std::vector<node> outIndices, std::vector<index> outIndptr,
+          std::vector<node> inIndices = {}, std::vector<index> inIndptr = {});
+
+    /**
      * Create a graph as copy of @a other.
      * @param other The graph to copy.
      */
@@ -798,22 +695,30 @@ public:
         : n(other.n), m(other.m), storedNumberOfSelfLoops(other.storedNumberOfSelfLoops),
           z(other.z), omega(other.omega), t(other.t), weighted(other.weighted),
           directed(other.directed), edgesIndexed(other.edgesIndexed), deletedID(other.deletedID),
-          exists(other.exists), inEdges(other.inEdges), outEdges(other.outEdges),
-          inEdgeWeights(other.inEdgeWeights), outEdgeWeights(other.outEdgeWeights),
-          inEdgeIds(other.inEdgeIds), outEdgeIds(other.outEdgeIds),
+          exists(other.exists), usingCSR(other.usingCSR),
+          outEdgesCSRIndices(other.outEdgesCSRIndices), outEdgesCSRIndptr(other.outEdgesCSRIndptr),
+          inEdgesCSRIndices(other.inEdgesCSRIndices), inEdgesCSRIndptr(other.inEdgesCSRIndptr),
           // call special constructors to copy attribute maps
           nodeAttributeMap(other.nodeAttributeMap, this),
-          edgeAttributeMap(other.edgeAttributeMap, this){};
+          edgeAttributeMap(other.edgeAttributeMap, this) {
+
+        // Only support copying CSR-based graphs
+        if (!other.usingCSR) {
+            throw std::runtime_error("Graph copy constructor only supports CSR-based graphs. Use "
+                                     "GraphW for vector-based graphs.");
+        }
+    }
 
     /** move constructor */
     Graph(Graph &&other) noexcept
         : n(other.n), m(other.m), storedNumberOfSelfLoops(other.storedNumberOfSelfLoops),
           z(other.z), omega(other.omega), t(other.t), weighted(other.weighted),
           directed(other.directed), edgesIndexed(other.edgesIndexed), deletedID(other.deletedID),
-          exists(std::move(other.exists)), inEdges(std::move(other.inEdges)),
-          outEdges(std::move(other.outEdges)), inEdgeWeights(std::move(other.inEdgeWeights)),
-          outEdgeWeights(std::move(other.outEdgeWeights)), inEdgeIds(std::move(other.inEdgeIds)),
-          outEdgeIds(std::move(other.outEdgeIds)),
+          exists(std::move(other.exists)), usingCSR(other.usingCSR),
+          outEdgesCSRIndices(std::move(other.outEdgesCSRIndices)),
+          outEdgesCSRIndptr(std::move(other.outEdgesCSRIndptr)),
+          inEdgesCSRIndices(std::move(other.inEdgesCSRIndices)),
+          inEdgesCSRIndptr(std::move(other.inEdgesCSRIndptr)),
           nodeAttributeMap(std::move(other.nodeAttributeMap)),
           edgeAttributeMap(std::move(other.edgeAttributeMap)) {
         // attributes: set graph pointer to this new graph
@@ -823,6 +728,22 @@ public:
 
     /** Default destructor */
     ~Graph() = default;
+
+    /**
+     * Constructor that creates a graph from Arrow CSR arrays for zero-copy memory efficiency.
+     * @param n Number of nodes.
+     * @param directed If set to @c true, the graph will be directed.
+     * @param outIndices Arrow array containing neighbor node IDs for outgoing edges (CSR indices).
+     * @param outIndptr Arrow array containing offsets into outIndices for each node (CSR indptr).
+     * @param inIndices Arrow array containing neighbor node IDs for incoming edges (only for
+     * directed graphs).
+     * @param inIndptr Arrow array containing offsets into inIndices for each node (only for
+     * directed graphs).
+     */
+    Graph(count n, bool directed, std::shared_ptr<arrow::UInt64Array> outIndices,
+          std::shared_ptr<arrow::UInt64Array> outIndptr,
+          std::shared_ptr<arrow::UInt64Array> inIndices = nullptr,
+          std::shared_ptr<arrow::UInt64Array> inIndptr = nullptr);
 
     /** move assignment operator */
     Graph &operator=(Graph &&other) noexcept {
@@ -836,12 +757,11 @@ public:
         std::swap(directed, other.directed);
         std::swap(edgesIndexed, other.edgesIndexed);
         std::swap(exists, other.exists);
-        std::swap(inEdges, other.inEdges);
-        std::swap(outEdges, other.outEdges);
-        std::swap(inEdgeWeights, other.inEdgeWeights);
-        std::swap(outEdgeWeights, other.outEdgeWeights);
-        std::swap(inEdgeIds, other.inEdgeIds);
-        std::swap(outEdgeIds, other.outEdgeIds);
+        std::swap(usingCSR, other.usingCSR);
+        std::swap(outEdgesCSRIndices, other.outEdgesCSRIndices);
+        std::swap(outEdgesCSRIndptr, other.outEdgesCSRIndptr);
+        std::swap(inEdgesCSRIndices, other.inEdgesCSRIndices);
+        std::swap(inEdgesCSRIndptr, other.inEdgesCSRIndptr);
         std::swap(deletedID, other.deletedID);
 
         // attributes: set graph pointer to this new graph
@@ -865,12 +785,6 @@ public:
         directed = other.directed;
         edgesIndexed = other.edgesIndexed;
         exists = other.exists;
-        inEdges = other.inEdges;
-        outEdges = other.outEdges;
-        inEdgeWeights = other.inEdgeWeights;
-        outEdgeWeights = other.outEdgeWeights;
-        inEdgeIds = other.inEdgeIds;
-        outEdgeIds = other.outEdgeIds;
         deletedID = other.deletedID;
 
         // call special constructors to copy attribute maps
@@ -880,60 +794,7 @@ public:
         return *this;
     };
 
-    /**
-     * Reserves memory in the node's edge containers for undirected graphs.
-     *
-     * @param u the node memory should be reserved for
-     * @param size the amount of memory to reserve
-     *
-     * This function is thread-safe if called from different
-     * threads on different nodes.
-     */
-    void preallocateUndirected(node u, size_t size);
-
-    /**
-     * Reserves memory in the node's edge containers for directed graphs.
-     *
-     * @param u the node memory should be reserved for
-     * @param inSize the amount of memory to reserve for in edges
-     * @param outSize the amount of memory to reserve for out edges
-     *
-     * This function is thread-safe if called from different
-     * threads on different nodes.
-     */
-    void preallocateDirected(node u, size_t outSize, size_t inSize);
-
-    /**
-     * Reserves memory in the node's edge containers for directed graphs.
-     *
-     * @param u the node memory should be reserved for
-     * @param outSize the amount of memory to reserve for out edges
-     *
-     * This function is thread-safe if called from different
-     * threads on different nodes.
-     */
-    void preallocateDirectedOutEdges(node u, size_t outSize);
-
-    /**
-     * Reserves memory in the node's edge containers for directed graphs.
-     *
-     * @param u the node memory should be reserved for
-     * @param inSize the amount of memory to reserve for in edges
-     *
-     * This function is thread-safe if called from different
-     * threads on different nodes.
-     */
-    void preallocateDirectedInEdges(node u, size_t inSize);
-
     /** EDGE IDS **/
-
-    /**
-     * Initially assign integer edge identifiers.
-     *
-     * @param force Force re-indexing of edges even if they have already been
-     * indexed
-     */
-    void indexEdges(bool force = false);
 
     /**
      * Checks if edges have been indexed
@@ -980,122 +841,10 @@ public:
     /** GRAPH INFORMATION **/
 
     /**
-     * Try to save some memory by shrinking internal data structures of the
-     * graph. Only run this once you finished editing the graph. Otherwise it
-     * will cause unnecessary reallocation of memory.
-     */
-    void shrinkToFit();
-
-    /**
      * DEPRECATED: this function will no longer be supported in later releases.
      * Compacts the adjacency arrays by re-using no longer needed slots from
      * deleted edges.
      */
-    void TLX_DEPRECATED(compactEdges());
-
-    /**
-     * Sorts the outgoing neighbors of a given node according to a user-defined comparison function.
-     *
-     * @param u The node whose outgoing neighbors will be sorted.
-     * @param lambda A binary predicate used to compare two neighbors. The predicate should
-     *               take two nodes as arguments and return true if the first node should
-     *               precede the second in the sorted order.
-     */
-    template <typename Lambda>
-    void sortNeighbors(node u, Lambda lambda);
-
-    /**
-     * Sorts the adjacency arrays by node id. While the running time is linear
-     * this temporarily duplicates the memory.
-     */
-    void sortEdges();
-
-    /**
-     * Sorts the adjacency arrays by a custom criterion.
-     *
-     * @param lambda Lambda function used to sort the edges. It takes two WeightedEdge
-     * e1 and e2 as input parameters, returns true if e1 < e2, false otherwise.
-     */
-    template <class Lambda>
-    void sortEdges(Lambda lambda);
-
-    /**
-     * Set edge count of the graph to edges.
-     * @param edges the edge count of a graph
-     */
-    void setEdgeCount(Unsafe, count edges) { m = edges; }
-
-    /**
-     * Set upper bound of edge count.
-     *
-     * @param newBound New upper edge id bound.
-     */
-    void setUpperEdgeIdBound(Unsafe, edgeid newBound) { omega = newBound; }
-
-    /**
-     * Set the number of self-loops.
-     *
-     * @param loops New number of self-loops.
-     */
-    void setNumberOfSelfLoops(Unsafe, count loops) { storedNumberOfSelfLoops = loops; }
-
-    /* NODE MODIFIERS */
-
-    /**
-     * Add a new node to the graph and return it.
-     * @return The new node.
-     */
-    node addNode();
-
-    /**
-     * Add numberOfNewNodes new nodes.
-     * @param  numberOfNewNodes Number of new nodes.
-     * @return The index of the last node added.
-     */
-    node addNodes(count numberOfNewNodes);
-
-    /**
-     * Remove a node @a v and all incident edges from the graph.
-     *
-     * Incoming as well as outgoing edges will be removed.
-     *
-     * @param v Node.
-     */
-    void removeNode(node v);
-
-    /**
-     * Removes out-going edges from node @u. If the graph is weighted and/or has edge ids, weights
-     * and/or edge ids will also be removed.
-     *
-     * @param u Node.
-     */
-    void removePartialOutEdges(Unsafe, node u) {
-        assert(hasNode(u));
-        outEdges[u].clear();
-        if (isWeighted()) {
-            outEdgeWeights[u].clear();
-        }
-        if (hasEdgeIds()) {
-            outEdgeIds[u].clear();
-        }
-    }
-
-    /**
-     * Removes in-going edges to node @u. If the graph is weighted and/or has edge ids, weights
-     * and/or edge ids will also be removed.
-     *
-     * @param u Node.
-     */
-    void removePartialInEdges(Unsafe, node u) {
-        assert(hasNode(u));
-        inEdges[u].clear();
-        if (isWeighted()) {
-            inEdgeWeights[u].clear();
-        }
-        if (hasEdgeIds()) {
-            inEdgeIds[u].clear();
-        }
-    }
 
     /**
      * Check if node @a v exists in the graph.
@@ -1107,14 +856,24 @@ public:
     bool hasNode(node v) const noexcept { return (v < z) && this->exists[v]; }
 
     /**
-     * Restores a previously deleted node @a v with its previous id in the
-     * graph.
+     * Check if edge (u, v) exists in the graph.
      *
-     * @param v Node.
-     *
+     * @param u First endpoint of edge.
+     * @param v Second endpoint of edge.
+     * @return @c true if edge exists, @c false otherwise.
      */
+    bool hasEdge(node u, node v) const noexcept;
 
-    void restoreNode(node v);
+    /**
+     * Remove adjacent edges satisfying a condition.
+     *
+     * @param u Node.
+     * @param condition A function that takes a node and returns true if the edge should be removed.
+     * @param edgesIn Whether to consider incoming edges.
+     * @return A pair of (number of removed edges, number of checked edges).
+     */
+    template <typename Condition>
+    std::pair<count, count> removeAdjacentEdges(node u, Condition condition, bool edgesIn = false);
 
     /** NODE PROPERTIES **/
     /**
@@ -1125,9 +884,14 @@ public:
      * @note The existence of the node is not checked. Calling this function with a non-existing
      * node results in a segmentation fault. Node existence can be checked by calling hasNode(u).
      */
-    count degree(node v) const {
+    virtual count degree(node v) const {
         assert(hasNode(v));
-        return outEdges[v].size();
+        if (usingCSR) {
+            return degreeCSR(v, false);
+        }
+        // Base Graph only supports CSR, GraphW will override for vector access
+        throw std::runtime_error(
+            "Base Graph class only supports CSR format. Use GraphW for mutable graphs.");
     }
 
     /**
@@ -1141,7 +905,11 @@ public:
      */
     count degreeIn(node v) const {
         assert(hasNode(v));
-        return directed ? inEdges[v].size() : outEdges[v].size();
+        if (usingCSR) {
+            return directed ? degreeCSR(v, true) : degreeCSR(v, false);
+        }
+        // Base Graph class only supports CSR format
+        throw std::runtime_error("Graph class requires CSR arrays for degree operations");
     }
 
     /**
@@ -1162,7 +930,11 @@ public:
     bool isIsolated(node v) const {
         if (!exists[v])
             throw std::runtime_error("Error, the node does not exist!");
-        return outEdges[v].empty() && (!directed || inEdges[v].empty());
+        if (usingCSR) {
+            return degreeCSR(v, false) == 0 && (!directed || degreeCSR(v, true) == 0);
+        }
+        // Base Graph class only supports CSR format
+        throw std::runtime_error("Graph class requires CSR arrays for isolation check");
     }
 
     /**
@@ -1184,172 +956,6 @@ public:
      * @return Weighted in-degree of @a v.
      */
     edgeweight weightedDegreeIn(node u, bool countSelfLoopsTwice = false) const;
-
-    /* EDGE MODIFIERS */
-
-    /**
-     * Insert an edge between the nodes @a u and @a v. If the graph is
-     * weighted you can optionally set a weight for this edge. The default
-     * weight is 1.0. Note: Multi-edges are not supported and will NOT be
-     * handled consistently by the graph data structure. It is possible to check
-     * for multi-edges by enabling parameter "checkForMultiEdges". If already present,
-     * the new edge is not inserted. Enabling this check increases the complexity of the function
-     * to O(max(deg(u), deg(v))).
-     * @param u Endpoint of edge.
-     * @param v Endpoint of edge.
-     * @param ew Optional edge weight.
-     * @param checkMultiEdge If true, this enables a check for a possible multi-edge.
-     * @return @c true if edge has been added, false otherwise (in case checkMultiEdge is set to
-     * true and the new edge would have been a multi-edge.)
-     */
-    bool addEdge(node u, node v, edgeweight ew = defaultEdgeWeight, bool checkMultiEdge = false);
-
-    /**
-     * Insert an edge between the nodes @a u and @a v. Unline the addEdge function, this function
-     * does not not add any information to v. If the graph is weighted you can optionally set a
-     * weight for this edge. The default weight is 1.0. Note: Multi-edges are not supported and will
-     * NOT be handled consistently by the graph data structure. It is possible to check
-     * for multi-edges by enabling parameter "checkForMultiEdges". If already present,
-     * the new edge is not inserted. Enabling this check increases the complexity of the function
-     * to O(max(deg(u), deg(v))).
-     * @param u Endpoint of edge.
-     * @param v Endpoint of edge.
-     * @param ew Optional edge weight.
-     * @param ew Optional edge weight.
-     * @param index Optional edge index.
-     * @param checkForMultiEdges If true, this enables a check for a possible multi-edge.
-     * @return @c true if edge has been added, false otherwise (in case checkMultiEdge is set to
-     * true and the new edge would have been a multi-edge.)
-     */
-    bool addPartialEdge(Unsafe, node u, node v, edgeweight ew = defaultEdgeWeight,
-                        uint64_t index = 0, bool checkForMultiEdges = false);
-
-    /**
-     * Insert an in edge between the nodes @a u and @a v in a directed graph. If the graph is
-     * weighted you can optionally set a weight for this edge. The default
-     * weight is 1.0. Note: Multi-edges are not supported and will NOT be
-     * handled consistently by the graph data structure. It is possible to check
-     * for multi-edges by enabling parameter "checkForMultiEdges". If already present,
-     * the new edge is not inserted. Enabling this check increases the complexity of the function
-     * to O(max(deg(u), deg(v))).
-     * @param u Endpoint of edge.
-     * @param v Endpoint of edge.
-     * @param ew Optional edge weight.
-     * @param index Optional edge index.
-     * @param checkForMultiEdges If true, this enables a check for a possible multi-edge.
-     * @return @c true if edge has been added, false otherwise (in case checkMultiEdge is set to
-     * true and the new edge would have been a multi-edge.)
-     */
-    bool addPartialInEdge(Unsafe, node u, node v, edgeweight ew = defaultEdgeWeight,
-                          uint64_t index = 0, bool checkForMultiEdges = false);
-
-    /**
-     * Insert an out edge between the nodes @a u and @a v in a directed graph. If the graph is
-     * weighted you can optionally set a weight for this edge. The default
-     * weight is 1.0. Note: Multi-edges are not supported and will NOT be
-     * handled consistently by the graph data structure. It is possible to check
-     * for multi-edges by enabling parameter "checkForMultiEdges". If already present,
-     * the new edge is not inserted. Enabling this check increases the complexity of the function
-     * to O(max(deg(u), deg(v))).
-     * @param u Endpoint of edge.
-     * @param v Endpoint of edge.
-     * @param ew Optional edge weight.
-     * @param index Optional edge index.
-     * @param checkForMultiEdges If true, this enables a check for a possible multi-edge.
-     * @return @c true if edge has been added, false otherwise (in case checkMultiEdge is set to
-     * true and the new edge would have been a multi-edge.)
-     */
-    bool addPartialOutEdge(Unsafe, node u, node v, edgeweight ew = defaultEdgeWeight,
-                           uint64_t index = 0, bool checkForMultiEdges = false);
-
-    /**
-     * If set to true, the ingoing and outgoing adjacency vectors will
-     * automatically be updated to maintain a sorting (if it existed before) by performing up to n-1
-     * swaps. If the user plans to remove multiple edges, better set it to false and call
-     * sortEdges() afterwards to avoid redundant swaps. Default = true.
-     */
-    void setKeepEdgesSorted(bool sorted = true) { maintainSortedEdges = sorted; }
-
-    /**
-     * If set to true, the EdgeIDs will automatically be adjusted,
-     * so that no gaps in between IDs exist. If the user plans to remove multiple edges, better set
-     * it to false and call indexEdges(force=true) afterwards to avoid redundant re-indexing.
-     * Default = true.
-     */
-    void setMaintainCompactEdges(bool compact = true) { maintainCompactEdges = compact; }
-
-    /**
-     * Returns true if edges are currently being sorted when removeEdge() is called.
-     */
-    bool getKeepEdgesSorted() const noexcept { return maintainSortedEdges; }
-
-    /*
-     * Returns true if edges are currently being compacted when removeEdge() is called.
-     */
-    bool getMaintainCompactEdges() const noexcept { return maintainCompactEdges; }
-
-    /**
-     *
-     * Removes the undirected edge {@a u,@a v}.
-     * @param u Endpoint of edge.
-     * @param v Endpoint of edge.
-     */
-    void removeEdge(node u, node v);
-
-    /**
-     * Removes all the edges in the graph.
-     */
-    void removeAllEdges();
-
-    /**
-     * Removes edges adjacent to a node according to a specific criterion.
-     *
-     * @param u The node whose adjacent edges shall be removed.
-     * @param condition A function that takes a node as an input and returns a
-     * bool. If true the edge (u, v) is removed.
-     * @param edgesIn Whether in-going or out-going edges shall be removed.
-     * @return std::pair<count, count> The number of removed edges (first) and the number of removed
-     * self-loops (second).
-     */
-    template <typename Condition>
-    std::pair<count, count> removeAdjacentEdges(node u, Condition condition, bool edgesIn = false);
-
-    /**
-     * Removes all self-loops in the graph.
-     */
-    void removeSelfLoops();
-
-    /**
-     * Removes all multi-edges in the graph.
-     */
-    void removeMultiEdges();
-
-    /**
-     * Changes the edges {@a s1, @a t1} into {@a s1, @a t2} and the edge {@a
-     * s2,
-     * @a t2} into {@a s2, @a t1}.
-     *
-     * If there are edge weights or edge ids, they are preserved. Note that no
-     * check is performed if the swap is actually possible, i.e. does not
-     * generate duplicate edges.
-     *
-     * @param s1 The first source
-     * @param t1 The first target
-     * @param s2 The second source
-     * @param t2 The second target
-     */
-    void swapEdge(node s1, node t1, node s2, node t2);
-
-    /**
-     * Checks if undirected edge {@a u,@a v} exists in the graph.
-     * @param u Endpoint of edge.
-     * @param v Endpoint of edge.
-     * @return <code>true</code> if the edge exists, <code>false</code>
-     * otherwise.
-     */
-    bool hasEdge(node u, node v) const noexcept;
-
-    /* GLOBAL PROPERTIES */
 
     /**
      * Returns <code>true</code> if this graph supports edge weights other
@@ -1386,8 +992,6 @@ public:
     /**
      * Return the number of loops {v,v} in the graph.
      * @return The number of loops.
-     * @note This involves calculation, so store result if needed multiple
-     * times.
      */
     count numberOfSelfLoops() const noexcept { return storedNumberOfSelfLoops; }
 
@@ -1396,6 +1000,16 @@ public:
      * @return An upper bound for the node ids.
      */
     index upperNodeIdBound() const noexcept { return z; }
+
+    /**
+     * Returns true if edges are currently being sorted when removeEdge() is called.
+     */
+    bool getKeepEdgesSorted() const noexcept { return maintainSortedEdges; }
+
+    /**
+     * Returns true if edges are currently being compacted when removeEdge() is called.
+     */
+    bool getMaintainCompactEdges() const noexcept { return maintainCompactEdges; }
 
     /**
      * Check for invalid graph states, such as multi-edges.
@@ -1437,16 +1051,6 @@ public:
     edgeweight weight(node u, node v) const;
 
     /**
-     * Set the weight of an edge. If the edge does not exist,
-     * it will be inserted.
-     *
-     * @param[in]	u	endpoint of edge
-     * @param[in]	v	endpoint of edge
-     * @param[in]	ew	edge weight
-     */
-    void setWeight(node u, node v, edgeweight ew);
-
-    /**
      * Set the weight to the i-th neighbour of u.
      *
      * @param[in]	u	endpoint of edge
@@ -1464,16 +1068,6 @@ public:
      */
     void setWeightAtIthInNeighbor(Unsafe, node u, index i, edgeweight ew);
 
-    /**
-     * Increase the weight of an edge. If the edge does not exist,
-     * it will be inserted.
-     *
-     * @param[in]	u	endpoint of edge
-     * @param[in]	v	endpoint of edge
-     * @param[in]	ew	edge weight
-     */
-    void increaseWeight(node u, node v, edgeweight ew);
-
     /* SUMS */
 
     /**
@@ -1490,7 +1084,11 @@ public:
      * @return @a i-th (outgoing) neighbor of @a u, or @c none if no such
      * neighbor exists.
      */
-    node getIthNeighbor(Unsafe, node u, index i) const { return outEdges[u][i]; }
+    node getIthNeighbor(Unsafe, node u, index i) const {
+        // Base Graph class only supports CSR format
+        throw std::runtime_error(
+            "getIthNeighbor not supported in base Graph class - use GraphW for mutable operations");
+    }
 
     /**
      * Return the weight to the i-th (outgoing) neighbor of @a u.
@@ -1501,7 +1099,9 @@ public:
      * neighbor exists.
      */
     edgeweight getIthNeighborWeight(Unsafe, node u, index i) const {
-        return isWeighted() ? outEdgeWeights[u][i] : defaultEdgeWeight;
+        // Base Graph class only supports CSR format
+        throw std::runtime_error("getIthNeighborWeight not supported in base Graph class - use "
+                                 "GraphW for mutable operations");
     }
 
     /**
@@ -1594,9 +1194,9 @@ public:
      * neighbor exists.
      */
     node getIthNeighbor(node u, index i) const {
-        if (!hasNode(u) || i >= outEdges[u].size())
-            return none;
-        return outEdges[u][i];
+        // Base Graph class only supports CSR format
+        throw std::runtime_error(
+            "getIthNeighbor not supported in base Graph class - use GraphW for mutable operations");
     }
 
     /**
@@ -1608,9 +1208,9 @@ public:
      * neighbor exists.
      */
     node getIthInNeighbor(node u, index i) const {
-        if (!hasNode(u) || i >= inEdges[u].size())
-            return none;
-        return inEdges[u][i];
+        // Base Graph class only supports CSR format
+        throw std::runtime_error("getIthInNeighbor not supported in base Graph class - use GraphW "
+                                 "for mutable operations");
     }
 
     /**
@@ -1622,9 +1222,9 @@ public:
      * neighbor exists.
      */
     edgeweight getIthNeighborWeight(node u, index i) const {
-        if (!hasNode(u) || i >= outEdges[u].size())
-            return nullWeight;
-        return isWeighted() ? outEdgeWeights[u][i] : defaultEdgeWeight;
+        // Base Graph class only supports CSR format
+        throw std::runtime_error("getIthNeighborWeight not supported in base Graph class - use "
+                                 "GraphW for mutable operations");
     }
 
     /**
@@ -1636,9 +1236,9 @@ public:
      * edge weight, or @c defaultEdgeWeight if unweighted.
      */
     std::pair<node, edgeweight> getIthNeighborWithWeight(node u, index i) const {
-        if (!hasNode(u) || i >= outEdges[u].size())
-            return {none, none};
-        return getIthNeighborWithWeight(unsafe, u, i);
+        // Base Graph class only supports CSR format
+        throw std::runtime_error("getIthNeighborWithWeight not supported in base Graph class - use "
+                                 "GraphW for mutable operations");
     }
 
     /**
@@ -1650,9 +1250,9 @@ public:
      * edge weight, or @c defaultEdgeWeight if unweighted.
      */
     std::pair<node, edgeweight> getIthNeighborWithWeight(Unsafe, node u, index i) const {
-        if (!isWeighted())
-            return {outEdges[u][i], defaultEdgeWeight};
-        return {outEdges[u][i], outEdgeWeights[u][i]};
+        // Base Graph class only supports CSR format
+        throw std::runtime_error("getIthNeighborWithWeight not supported in base Graph class - use "
+                                 "GraphW for mutable operations");
     }
 
     /**
@@ -1664,10 +1264,9 @@ public:
      * edge id, or @c none if no such neighbor exists.
      */
     std::pair<node, edgeid> getIthNeighborWithId(node u, index i) const {
-        assert(hasEdgeIds());
-        if (!hasNode(u) || i >= outEdges[u].size())
-            return {none, none};
-        return {outEdges[u][i], outEdgeIds[u][i]};
+        // Base Graph class only supports CSR format
+        throw std::runtime_error("getIthNeighborWithId not supported in base Graph class - use "
+                                 "GraphW for mutable operations");
     }
 
     /* NODE ITERATORS */
@@ -1918,7 +1517,9 @@ void erase(node u, index idx, std::vector<std::vector<T>> &vec);
 // implementation for weighted == true
 template <bool hasWeights>
 inline edgeweight Graph::getOutEdgeWeight(node u, index i) const {
-    return outEdgeWeights[u][i];
+    // Base Graph class only supports CSR format
+    throw std::runtime_error(
+        "getOutEdgeWeight not supported in base Graph class - use GraphW for mutable operations");
 }
 
 // implementation for weighted == false
@@ -1930,7 +1531,9 @@ inline edgeweight Graph::getOutEdgeWeight<false>(node, index) const {
 // implementation for weighted == true
 template <bool hasWeights>
 inline edgeweight Graph::getInEdgeWeight(node u, index i) const {
-    return inEdgeWeights[u][i];
+    // Base Graph class only supports CSR format
+    throw std::runtime_error(
+        "getInEdgeWeight not supported in base Graph class - use GraphW for mutable operations");
 }
 
 // implementation for weighted == false
@@ -1942,7 +1545,9 @@ inline edgeweight Graph::getInEdgeWeight<false>(node, index) const {
 // implementation for hasEdgeIds == true
 template <bool graphHasEdgeIds>
 inline edgeid Graph::getOutEdgeId(node u, index i) const {
-    return outEdgeIds[u][i];
+    // Base Graph class only supports CSR format
+    throw std::runtime_error(
+        "getOutEdgeId not supported in base Graph class - use GraphW for mutable operations");
 }
 
 // implementation for hasEdgeIds == false
@@ -1954,7 +1559,9 @@ inline edgeid Graph::getOutEdgeId<false>(node, index) const {
 // implementation for hasEdgeIds == true
 template <bool graphHasEdgeIds>
 inline edgeid Graph::getInEdgeId(node u, index i) const {
-    return inEdgeIds[u][i];
+    // Base Graph class only supports CSR format
+    throw std::runtime_error(
+        "getInEdgeId not supported in base Graph class - use GraphW for mutable operations");
 }
 
 // implementation for hasEdgeIds == false
@@ -1977,32 +1584,94 @@ inline bool Graph::useEdgeInIteration<false>(node u, node v) const {
 
 template <bool graphIsDirected, bool hasWeights, bool graphHasEdgeIds, typename L>
 inline void Graph::forOutEdgesOfImpl(node u, L handle) const {
-    for (index i = 0; i < outEdges[u].size(); ++i) {
-        node v = outEdges[u][i];
+    if (!exists[u])
+        return;
 
-        if (useEdgeInIteration<graphIsDirected>(u, v)) {
-            edgeLambda<L>(handle, u, v, getOutEdgeWeight<hasWeights>(u, i),
-                          getOutEdgeId<graphHasEdgeIds>(u, i));
+    if (usingCSR) {
+        // CSR-based implementation
+        auto [neighbors, degree] = getCSROutNeighbors(u);
+        if (neighbors == nullptr || degree == 0)
+            return;
+
+        for (count i = 0; i < degree; ++i) {
+            node v = neighbors[i];
+            if (!exists[v])
+                continue;
+
+            // For undirected graphs, only process edge if u >= v to avoid duplicates
+            if constexpr (!graphIsDirected) {
+                if (!useEdgeInIteration<graphIsDirected>(u, v))
+                    continue;
+            }
+
+            // Get edge weight (currently CSR graphs are unweighted, so use defaultEdgeWeight)
+            edgeweight weight = hasWeights ? defaultEdgeWeight : defaultEdgeWeight;
+
+            // Get edge ID (CSR graphs don't currently support edge IDs)
+            edgeid eid = graphHasEdgeIds ? none : none;
+
+            // Call the appropriate lambda based on its signature
+            edgeLambda(handle, u, v, weight, eid);
         }
+    } else {
+        // Vector-based graphs should use GraphW
+        throw std::runtime_error("forOutEdgesOfImpl not supported for vector-based graphs in base "
+                                 "Graph class - use GraphW");
     }
 }
 
 template <bool graphIsDirected, bool hasWeights, bool graphHasEdgeIds, typename L>
 inline void Graph::forInEdgesOfImpl(node u, L handle) const {
-    if (graphIsDirected) {
-        for (index i = 0; i < inEdges[u].size(); i++) {
-            node v = inEdges[u][i];
+    if (!exists[u])
+        return;
 
-            edgeLambda<L>(handle, u, v, getInEdgeWeight<hasWeights>(u, i),
-                          getInEdgeId<graphHasEdgeIds>(u, i));
+    if (usingCSR) {
+        if constexpr (graphIsDirected) {
+            // For directed graphs, use incoming edges
+            auto [neighbors, degree] = getCSRInNeighbors(u);
+            if (neighbors == nullptr || degree == 0)
+                return;
+
+            for (count i = 0; i < degree; ++i) {
+                node v = neighbors[i];
+                if (!exists[v])
+                    continue;
+
+                // Get edge weight (currently CSR graphs are unweighted)
+                edgeweight weight = hasWeights ? defaultEdgeWeight : defaultEdgeWeight;
+
+                // Get edge ID (CSR graphs don't currently support edge IDs)
+                edgeid eid = graphHasEdgeIds ? none : none;
+
+                // For incoming edges, v is the source and u is the target
+                edgeLambda(handle, v, u, weight, eid);
+            }
+        } else {
+            // For undirected graphs, incoming edges are the same as outgoing edges
+            // but we need to swap u and v in the handle call
+            auto [neighbors, degree] = getCSROutNeighbors(u);
+            if (neighbors == nullptr || degree == 0)
+                return;
+
+            for (count i = 0; i < degree; ++i) {
+                node v = neighbors[i];
+                if (!exists[v])
+                    continue;
+
+                // Get edge weight (currently CSR graphs are unweighted)
+                edgeweight weight = hasWeights ? defaultEdgeWeight : defaultEdgeWeight;
+
+                // Get edge ID (CSR graphs don't currently support edge IDs)
+                edgeid eid = graphHasEdgeIds ? none : none;
+
+                // For undirected graphs, call with v, u (swapped)
+                edgeLambda(handle, v, u, weight, eid);
+            }
         }
     } else {
-        for (index i = 0; i < outEdges[u].size(); ++i) {
-            node v = outEdges[u][i];
-
-            edgeLambda<L>(handle, u, v, getOutEdgeWeight<hasWeights>(u, i),
-                          getOutEdgeId<graphHasEdgeIds>(u, i));
-        }
+        // Vector-based graphs should use GraphW
+        throw std::runtime_error("forInEdgesOfImpl not supported for vector-based graphs in base "
+                                 "Graph class - use GraphW");
     }
 }
 
@@ -2025,18 +1694,42 @@ template <bool graphIsDirected, bool hasWeights, bool graphHasEdgeIds, typename 
 inline double Graph::parallelSumForEdgesImpl(L handle) const {
     double sum = 0.0;
 
-#pragma omp parallel for reduction(+ : sum)
-    for (omp_index u = 0; u < static_cast<omp_index>(z); ++u) {
-        for (index i = 0; i < outEdges[u].size(); ++i) {
-            node v = outEdges[u][i];
+    if (usingCSR) {
+        // CSR-based parallel implementation
+#pragma omp parallel for schedule(guided) reduction(+ : sum)
+        for (omp_index u = 0; u < static_cast<omp_index>(z); ++u) {
+            if (!exists[u])
+                continue;
 
-            // undirected, do not iterate over edges twice
-            // {u, v} instead of (u, v); if v == none, u > v is not fulfilled
-            if (useEdgeInIteration<graphIsDirected>(u, v)) {
-                sum += edgeLambda<L>(handle, u, v, getOutEdgeWeight<hasWeights>(u, i),
-                                     getOutEdgeId<graphHasEdgeIds>(u, i));
+            auto [neighbors, degree] = getCSROutNeighbors(u);
+            if (neighbors == nullptr || degree == 0)
+                continue;
+
+            for (count i = 0; i < degree; ++i) {
+                node v = neighbors[i];
+                if (!exists[v])
+                    continue;
+
+                // For undirected graphs, only process edge if u >= v to avoid duplicates
+                if constexpr (!graphIsDirected) {
+                    if (!useEdgeInIteration<graphIsDirected>(u, v))
+                        continue;
+                }
+
+                // Get edge weight (currently CSR graphs are unweighted)
+                edgeweight weight = hasWeights ? defaultEdgeWeight : defaultEdgeWeight;
+
+                // Get edge ID (CSR graphs don't currently support edge IDs)
+                edgeid eid = graphHasEdgeIds ? none : none;
+
+                // Call the lambda and add result to sum
+                sum += edgeLambda(handle, u, v, weight, eid);
             }
         }
+    } else {
+        // Vector-based graphs should use GraphW
+        throw std::runtime_error("parallelSumForEdgesImpl not supported for vector-based graphs in "
+                                 "base Graph class - use GraphW");
     }
 
     return sum;
@@ -2125,22 +1818,42 @@ void Graph::forNeighborsOf(node u, L handle) const {
 
 template <typename L>
 void Graph::forEdgesOf(node u, L handle) const {
-    switch (weighted + 2 * edgesIndexed) {
-    case 0: // not weighted, no edge ids
-        forOutEdgesOfImpl<true, false, false, L>(u, handle);
-        break;
+    if (directed) {
+        switch (weighted + 2 * edgesIndexed) {
+        case 0: // not weighted, no edge ids
+            forOutEdgesOfImpl<true, false, false, L>(u, handle);
+            break;
 
-    case 1: // weighted, no edge ids
-        forOutEdgesOfImpl<true, true, false, L>(u, handle);
-        break;
+        case 1: // weighted, no edge ids
+            forOutEdgesOfImpl<true, true, false, L>(u, handle);
+            break;
 
-    case 2: // not weighted, with edge ids
-        forOutEdgesOfImpl<true, false, true, L>(u, handle);
-        break;
+        case 2: // not weighted, with edge ids
+            forOutEdgesOfImpl<true, false, true, L>(u, handle);
+            break;
 
-    case 3: // weighted, with edge ids
-        forOutEdgesOfImpl<true, true, true, L>(u, handle);
-        break;
+        case 3: // weighted, with edge ids
+            forOutEdgesOfImpl<true, true, true, L>(u, handle);
+            break;
+        }
+    } else {
+        switch (weighted + 2 * edgesIndexed) {
+        case 0: // not weighted, no edge ids
+            forOutEdgesOfImpl<false, false, false, L>(u, handle);
+            break;
+
+        case 1: // weighted, no edge ids
+            forOutEdgesOfImpl<false, true, false, L>(u, handle);
+            break;
+
+        case 2: // not weighted, with edge ids
+            forOutEdgesOfImpl<false, false, true, L>(u, handle);
+            break;
+
+        case 3: // weighted, with edge ids
+            forOutEdgesOfImpl<false, true, true, L>(u, handle);
+            break;
+        }
     }
 }
 
@@ -2247,145 +1960,9 @@ double Graph::parallelSumForEdges(L handle) const {
 
 template <typename Condition>
 std::pair<count, count> Graph::removeAdjacentEdges(node u, Condition condition, bool edgesIn) {
-    count removedEdges = 0;
-    count removedSelfLoops = 0;
-
-    // For directed graphs, this function is supposed to be called twice: one to remove out-edges,
-    // and one to remove in-edges.
-    auto &edges_ = edgesIn ? inEdges[u] : outEdges[u];
-    for (index vi = 0; vi < edges_.size();) {
-        if (condition(edges_[vi])) {
-            const auto isSelfLoop = (edges_[vi] == u);
-            removedSelfLoops += isSelfLoop;
-            removedEdges += !isSelfLoop;
-            edges_[vi] = edges_.back();
-            edges_.pop_back();
-            if (isWeighted()) {
-                auto &weights_ = edgesIn ? inEdgeWeights[u] : outEdgeWeights[u];
-                weights_[vi] = weights_.back();
-                weights_.pop_back();
-            }
-            if (hasEdgeIds()) {
-                auto &edgeIds_ = edgesIn ? inEdgeIds[u] : outEdgeIds[u];
-                edgeIds_[vi] = edgeIds_.back();
-                edgeIds_.pop_back();
-            }
-        } else {
-            ++vi;
-        }
-    }
-
-    return {removedEdges, removedSelfLoops};
-}
-
-template <typename Lambda>
-void Graph::sortNeighbors(node u, Lambda lambda) {
-    if ((degreeIn(u) < 2) && (degree(u) < 2)) {
-        return;
-    }
-    // Sort the outEdge-Attributes
-    std::vector<index> outIndices(outEdges[u].size());
-    std::iota(outIndices.begin(), outIndices.end(), 0);
-    std::ranges::sort(outIndices,
-                      [&](index a, index b) { return lambda(outEdges[u][a], outEdges[u][b]); });
-
-    Aux::ArrayTools::applyPermutation(outEdges[u].begin(), outEdges[u].end(), outIndices.begin());
-
-    if (weighted) {
-        Aux::ArrayTools::applyPermutation(outEdgeWeights[u].begin(), outEdgeWeights[u].end(),
-                                          outIndices.begin());
-    }
-
-    if (edgesIndexed) {
-        Aux::ArrayTools::applyPermutation(outEdgeIds[u].begin(), outEdgeIds[u].end(),
-                                          outIndices.begin());
-    }
-
-    // For directed graphs we need to sort the inEdge-Attributes separately
-    if (directed) {
-        std::vector<index> inIndices(inEdges[u].size());
-        std::iota(inIndices.begin(), inIndices.end(), 0);
-
-        std::ranges::sort(inIndices,
-                          [&](index a, index b) { return lambda(inEdges[u][a], inEdges[u][b]); });
-
-        Aux::ArrayTools::applyPermutation(inEdges[u].begin(), inEdges[u].end(), inIndices.begin());
-
-        if (weighted) {
-            Aux::ArrayTools::applyPermutation(inEdgeWeights[u].begin(), inEdgeWeights[u].end(),
-                                              inIndices.begin());
-        }
-
-        if (edgesIndexed) {
-            Aux::ArrayTools::applyPermutation(inEdgeIds[u].begin(), inEdgeIds[u].end(),
-                                              inIndices.begin());
-        }
-    }
-}
-
-template <class Lambda>
-void Graph::sortEdges(Lambda lambda) {
-
-    std::vector<std::vector<index>> indicesGlobal(omp_get_max_threads());
-
-    const auto sortAdjacencyArrays = [&](node u, std::vector<node> &adjList,
-                                         std::vector<edgeweight> &weights,
-                                         std::vector<edgeid> &edgeIds) -> void {
-        auto &indices = indicesGlobal[omp_get_thread_num()];
-        if (adjList.size() > indices.size())
-            indices.resize(adjList.size());
-
-        const auto indicesEnd =
-            indices.begin()
-            + static_cast<
-                std::iterator_traits<std::vector<index>::const_iterator>::difference_type>(
-                adjList.size());
-        std::iota(indices.begin(), indicesEnd, 0);
-
-        if (isWeighted()) {
-            if (hasEdgeIds())
-                std::sort(indices.begin(), indicesEnd, [&](auto a, auto b) -> bool {
-                    return lambda(WeightedEdgeWithId{u, adjList[a], weights[a], edgeIds[a]},
-                                  WeightedEdgeWithId{u, adjList[b], weights[b], edgeIds[b]});
-                });
-            else
-                std::sort(indices.begin(), indicesEnd, [&](auto a, auto b) -> bool {
-                    return lambda(WeightedEdgeWithId{u, adjList[a], weights[a], 0},
-                                  WeightedEdgeWithId{u, adjList[b], weights[b], 0});
-                });
-        } else if (hasEdgeIds())
-            std::sort(indices.begin(), indicesEnd, [&](auto a, auto b) -> bool {
-                return lambda(WeightedEdgeWithId{u, adjList[a], defaultEdgeWeight, edgeIds[a]},
-                              WeightedEdgeWithId{u, adjList[b], defaultEdgeWeight, edgeIds[b]});
-            });
-        else
-            std::sort(indices.begin(), indicesEnd, [&](auto a, auto b) -> bool {
-                return lambda(WeightedEdgeWithId{u, adjList[a], defaultEdgeWeight, 0},
-                              WeightedEdgeWithId{u, adjList[b], defaultEdgeWeight, 0});
-            });
-
-        Aux::ArrayTools::applyPermutation(adjList.begin(), adjList.end(), indices.begin());
-
-        if (isWeighted())
-            Aux::ArrayTools::applyPermutation(weights.begin(), weights.end(), indices.begin());
-
-        if (hasEdgeIds())
-            Aux::ArrayTools::applyPermutation(edgeIds.begin(), edgeIds.end(), indices.begin());
-    };
-
-    balancedParallelForNodes([&](const node u) {
-        if (degree(u) < 2)
-            return;
-
-        std::vector<edgeweight> dummyEdgeWeights;
-        std::vector<edgeid> dummyEdgeIds;
-        sortAdjacencyArrays(u, outEdges[u], isWeighted() ? outEdgeWeights[u] : dummyEdgeWeights,
-                            hasEdgeIds() ? outEdgeIds[u] : dummyEdgeIds);
-
-        if (isDirected())
-            sortAdjacencyArrays(u, inEdges[u], isWeighted() ? inEdgeWeights[u] : dummyEdgeWeights,
-                                hasEdgeIds() ? inEdgeIds[u] : dummyEdgeIds);
-    });
+    // Base Graph class only supports CSR format and is immutable
+    throw std::runtime_error("removeAdjacentEdges not supported in base Graph class - use GraphW "
+                             "for mutable operations");
 }
 
 } /* namespace NetworKit */
